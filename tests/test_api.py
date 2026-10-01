@@ -214,3 +214,81 @@ def test_expedition_send_requires_daily_phase(client):
         "member_ids": [1], "supplies": {},
     })
     assert r.status_code == 400
+
+
+def test_encounter_supply_exhaustion_converges_via_api(client):
+    """遭遇把补给扣空：API 结算遭遇即完成返程收敛，会话回到无队伍状态。"""
+    team = {}
+
+    def setup(db, gs, eng):
+        # weather·就地躲避：食物 -3 水 -3；1 人队带 4/4，行军消耗 1 后剩 3/3
+        eng.rand = ScriptedRand(encounter_key="weather")
+        eng.send_expedition([gs.residents[0].id], {FOOD: 4, WATER: 4})
+        enc = eng.advance_day()
+        team["token"] = enc["token"]
+    (sid,) = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/expedition/resolve", json={
+        "choice_key": "take_shelter", "token": team["token"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["expedition"] is None            # 当场收敛，无零补给僵尸队伍
+    assert body["status"] == "running"
+    assert all(x["away"] == 0 for x in body["residents"])
+    # 同一遭遇请求重试：幂等回放 200，资源/人口不再变化
+    food = body["resources"]["food"]
+    survivors = body["survivors"]
+    r2 = client.post(f"/api/sessions/{sid}/expedition/resolve", json={
+        "choice_key": "take_shelter", "token": team["token"],
+    })
+    assert r2.status_code == 200
+    assert r2.json()["resources"]["food"] == food
+    assert r2.json()["survivors"] == survivors
+
+
+def test_concurrent_fatal_encounter_loser_replays_200(client):
+    """致命遭遇已被另一请求结算并收敛：落败方凭遭遇 token 重试 → 200 回放。"""
+    team = {}
+
+    def setup(db, gs, eng):
+        gs.residents[0].health = 5
+        eng.rand = ScriptedRand(encounter_key="weather")
+        eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+        enc = eng.advance_day()
+        team["token"] = enc["token"]
+        # 对家先结算：全体健康 -6 杀死单人队 → 遭遇 + 返程收敛一次完成
+        detail, replayed = eng.resolve_expedition_encounter(
+            "push_through", token=enc["token"]
+        )
+        assert replayed is False
+        assert gs.expedition is None
+        assert gs.survivors == 2
+    (sid,) = _seed(setup)
+    survivors_after = client.get(f"/api/sessions/{sid}").json()["survivors"]
+    assert survivors_after == 2
+    # 落败方带相同负载重试
+    r = client.post(f"/api/sessions/{sid}/expedition/resolve", json={
+        "choice_key": "push_through", "token": team["token"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["expedition"] is None
+    assert body["survivors"] == 2  # 人口没有第二次扣减
+
+
+def test_fatal_encounter_wrong_choice_after_convergence_409(client):
+    """收敛完成后用同 token 另一选项重试 → 409，不能回放成别人的结算。"""
+    team = {}
+
+    def setup(db, gs, eng):
+        gs.residents[0].health = 5
+        eng.rand = ScriptedRand(encounter_key="weather")
+        eng.send_expedition([gs.residents[0].id], {FOOD: 20, WATER: 20})
+        enc = eng.advance_day()
+        team["token"] = enc["token"]
+        eng.resolve_expedition_encounter("push_through", token=enc["token"])
+    (sid,) = _seed(setup)
+    r = client.post(f"/api/sessions/{sid}/expedition/resolve", json={
+        "choice_key": "take_shelter", "token": team["token"],
+    })
+    assert r.status_code == 409

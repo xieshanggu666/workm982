@@ -166,40 +166,57 @@ class BunkerEngine:
         # 终局或存在待处理抉择（危机/探索遭遇）时都不能推进：抉择不可被"再点一天"跳过
         self._require_phase(PHASE_DAILY, "存在待处理抉择，必须先完成才能推进")
         self.session.day += 1
+        # 在任何产出/探索队结算之前快照当日终局裁决：抵达目标日立即胜利；
+        # 若推进前已全线枯竭，随后的当日产出或探索队带回的战利品/余粮
+        # 都不得把败局“救回”——终局在当天只收敛一次
+        pre_verdict = self._end_verdict()
         self._apply_production_and_consumption()
         self._apply_health_morale()
         exp = self.session.expedition
         if exp and exp.get("status") == "away":
             # 探索队在外出差：地堡按在堡人口结算，探索队消耗自带物资、行军并触发遭遇
-            self._apply_expedition_travel(exp)
+            self._apply_expedition_travel(exp, pre_verdict=pre_verdict)
             # 强制返程（补给耗尽/期满/全员失联）会清除探索队状态：
             # 此时不得再用旧 exp 触发遭遇，否则会把已结算的队伍恢复成"在外"
             if self.session.expedition is None:
-                self._check_end()
+                self._check_end(forced_verdict=pre_verdict)
                 return None
             # 终局优先：抵达目标日胜利，或地堡因在堡匮乏/人口归零失败时，
             # 在外队伍先安全返程（战利品入库、剩余物资归还、幸存者归队），
             # 再统一收敛到 ended——绝不在 ended 档案上留下无法处理的"僵尸队伍"
-            if self._end_conditions_met():
-                self._settle_expedition(self.session.expedition, reason="终局已至，探索队返程")
-                self._check_end()
+            if pre_verdict is not None or self._end_conditions_met():
+                self._settle_expedition(
+                    self.session.expedition, reason="终局已至，探索队返程"
+                )
+                self._check_end(forced_verdict=pre_verdict)
                 return None
             # 探索队行军中：触发遭遇（替代地堡危机），遭遇挂起后进入 expedition 阶段
             return self._maybe_trigger_expedition_encounter(self.session.expedition)
         # 终局优先：抵达目标日或全面崩溃直接结算结局，不再凭空挂起一个
         # 永远无法处理的危机（统一每日推进 → 危机处理 → 终局的流转）
-        if self._check_end():
+        if self._check_end(forced_verdict=pre_verdict):
             return None
         return self._maybe_trigger_crisis()
 
     def _end_conditions_met(self):
         """只判定终局条件、不写终局状态（用于终局前的探索队返程收敛）。"""
+        return self._end_verdict() is not None
+
+    def _end_verdict(self):
+        """当前状态对应的终局裁决：返回 None（未终局）或 (win, reason)。
+
+        纯判定、不写状态。返程结算在战利品/余粮入库前先快照一次裁决，
+        保证“全线枯竭”的败局不会被随后入库的战利品抬过阈值而“复活”，
+        终局状态只收敛一次且与结算路径（主动返程/强制返程/遭遇收敛）无关。
+        """
         if self.session.day >= self.session.target_day:
-            return True
+            return True, f"坚持到第{self.session.day}天，末日阴影散去，幸存者们走向了新生。"
         if self.session.survivors <= 0:
-            return True
+            return False, "所有幸存者都已逝去，地堡陷入永恒的寂静。"
         res = self.get_resources()
-        return all(res.get(k, 0) <= 1 for k in RESOURCE_KEYS)
+        if all(res.get(k, 0) <= 1 for k in RESOURCE_KEYS):
+            return False, "食物、水源、电力和氧气全线枯竭，地堡无法再维系生命。"
+        return None
 
     def _apply_production_and_consumption(self):
         # 离堡人员不消耗地堡物资（吃自带口粮），地堡消耗只计在堡人口
@@ -619,27 +636,35 @@ class BunkerEngine:
         self._log("system", "探索队出发", f"{names} 携带物资外出探索。", decision="派遣探索队")
         return exp
 
-    def _apply_expedition_travel(self, exp):
-        """探索队每日行军：消耗自带物资、累计天数，触发强制返程判定。"""
+    def _apply_expedition_travel(self, exp, pre_verdict=None):
+        """探索队每日行军：消耗自带物资、累计天数，触发强制返程判定。
+
+        pre_verdict 为当日推进开始时快照的终局裁决（如已全线枯竭），
+        透传给返程结算，避免行军/入库把当日败局“救回”。
+        """
         alive_members = [r for r in self._away_residents() if r.alive]
         if not alive_members:
             # 全员失联：强制返程（无人生还）
-            self._settle_expedition(exp, reason="探索队全员失联")
+            self._settle_expedition(exp, reason="探索队全员失联", pre_verdict=pre_verdict)
             return
         exp["travel_days"] = exp.get("travel_days", 0) + 1
-        # 消耗自带口粮
+        # 消耗自带口粮（按存活人数；阵亡者不再消耗）
         n = len(alive_members)
         supplies = exp.get("supplies", {})
         for k in (FOOD, WATER):
             cost = EXPEDITION_SUPPLY_PER_DAY[k] * n
-            supplies[k] = round(supplies.get(k, 0.0) - cost, 1)
+            supplies[k] = round(max(0.0, supplies.get(k, 0.0) - cost), 1)
         exp["supplies"] = supplies
-        # 物资耗尽或达到最长探索天数：强制返程
+        # 物资耗尽或达到最长探索天数：当日强制返程，补给不得出现负值快照
         if supplies.get(FOOD, 0) <= 0 or supplies.get(WATER, 0) <= 0:
-            self._settle_expedition(exp, reason="补给耗尽，探索队被迫返程")
+            self._settle_expedition(
+                exp, reason="补给耗尽，探索队被迫返程", pre_verdict=pre_verdict
+            )
             return
         if exp["travel_days"] >= EXPEDITION_MAX_DAYS:
-            self._settle_expedition(exp, reason="探索期满，探索队返程")
+            self._settle_expedition(
+                exp, reason="探索期满，探索队返程", pre_verdict=pre_verdict
+            )
             return
         # 整体回写，确保 JSON 列变更被追踪并落库
         self.session.expedition = dict(exp)
@@ -712,6 +737,22 @@ class BunkerEngine:
             return rec.get("detail", ""), True
         return None, False
 
+    def _encounter_settlement_replay(self, token, choice_key=None):
+        """遭遇请求命中“由该遭遇直接触发的返程结算”凭据时安全回放。
+
+        遭遇结算后若队伍当场收敛（补给耗尽/全员阵亡/终局），档案级凭据会被
+        返程记录覆盖，但该记录仍挂着本次遭遇的一次性 token。并发落败或连点
+        凭 token 命中这里：回放返程结算明细，绝不二次入库战利品。
+        """
+        rec = self.session.last_expedition
+        if not token or not rec or rec.get("action") != self._EXP_ACT_RETURN:
+            return None, False
+        if rec.get("token") != token:
+            return None, False
+        if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
+            return None, False
+        return rec.get("detail", ""), True
+
     def _remember_expedition(self, action, token, detail, exp_token=None, choice_key=None):
         """把已完成的探索队动作写入档案级幂等凭据。
 
@@ -743,6 +784,11 @@ class BunkerEngine:
         )
         if replay[0] is not None:
             return replay
+        # 遭遇已直接触发队伍收敛（补给耗尽/全员阵亡/终局）：凭据已被返程记录
+        # 覆盖，但记录上仍挂着本次遭遇 token，命中则回放返程明细而非 409
+        converged = self._encounter_settlement_replay(token, choice_key=choice_key)
+        if converged[0] is not None:
+            return converged
         exp = self.session.expedition
         if not exp or exp.get("status") != "away":
             # 携带遭遇凭据却找不到在外队伍：队伍已被其他请求召回，状态已前进
@@ -777,6 +823,7 @@ class BunkerEngine:
                 raise BunkerEngineError("目标队员不在队中或已故，无法作为效果目标")
         # 在应用任何效果前完成校验，保证失败时档案状态不发生部分变更
         detail_parts = []
+        exp.setdefault("casualties", [])
         alive_members = [r for r in self._away_residents() if r.alive]
         # 战利品（单独累计，返程时统一入库）
         loot = exp.get("loot", {})
@@ -804,13 +851,19 @@ class BunkerEngine:
                 scope = "全体队员"
             for r in pool:
                 setattr(r, stat, _clamp(getattr(r, stat) + val))
-                if r.health <= 0 and r.alive:
-                    r.alive = 0
-                    r.health = 0
-                    if r.id not in exp.get("casualties", []):
-                        exp["casualties"].append(r.id)
-                        self.session.survivors = max(0, self.session.survivors - 1)
             detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
+        # 全部效果施加完毕后统一收敛伤亡：健康归零即阵亡。单体/全体效果
+        # （以及遭遇前已濒死、被本次效果带过零点的队员）在同一次扫描中处理，
+        # 保证人口只扣一次、casualties 不重不漏
+        casualties = exp.get("casualties", [])
+        for r in alive_members:
+            if r.health <= 0 and r.alive:
+                r.alive = 0
+                r.health = 0
+                if r.id not in casualties:
+                    casualties.append(r.id)
+                    self.session.survivors = max(0, self.session.survivors - 1)
+        exp["casualties"] = casualties
         # 偶遇幸存者加入队伍
         if effects.get("add_resident"):
             name = self._random_survivor_name()
@@ -837,11 +890,31 @@ class BunkerEngine:
             self._EXP_ACT_ENCOUNTER, enc_token, detail,
             exp_token=exp.get("token"), choice_key=choice["key"],
         )
-        # 人口归零等终局条件：先让队伍安全返程再收敛到 ended，
-        # 避免在终局档案上留下无法处理的“僵尸队伍”
-        if self._end_conditions_met():
-            self._settle_expedition(self.session.expedition, reason="终局已至，探索队返程")
-            self._check_end()
+        # 遭遇结算后立即收敛，不把“零补给 / 全员阵亡 / 人口归零”的队伍留给下一步：
+        #   1) 全员阵亡 —— 无人生还的队伍不能继续行军（僵尸队伍）
+        #   2) 自带补给耗尽 —— 无需再等一次“推进一天”，当场被迫返程
+        #   3) 人口归零/抵达目标日等终局 —— 先安全返程再收敛到 ended
+        # 返程结算内部会在战利品入库前快照终局裁决，收敛只会发生一次
+        alive_after = [r for r in self._away_residents() if r.alive]
+        supplies_after = exp.get("supplies", {})
+        supplies_out = supplies_after.get(FOOD, 0) <= 0 or supplies_after.get(WATER, 0) <= 0
+        settle_reason = None
+        if not alive_after:
+            settle_reason = "探索队全员失联"
+        elif supplies_out:
+            settle_reason = "补给耗尽，探索队被迫返程"
+        elif self._end_conditions_met():
+            settle_reason = "终局已至，探索队返程"
+        if settle_reason is not None:
+            return_detail, _ = self._settle_expedition(
+                self.session.expedition, reason=settle_reason,
+                enc_token=enc_token, enc_choice=choice["key"],
+            )
+            # 遭遇响应同时承载遭遇效果与当场返程结算；返程凭据记录同一份
+            # 明细，保证该遭遇的连点/并发落败回放结果逐字一致
+            detail = f"{detail}；队伍返程：{return_detail}"
+            self.session.last_expedition["detail"] = detail
+            return detail, False
         return detail, False
 
     def reconcile_stale_expedition(self, action, token=None, choice_key=None, exp_token=None):
@@ -852,6 +925,13 @@ class BunkerEngine:
         rec = self.session.last_expedition
         if action == self._EXP_ACT_ENCOUNTER:
             ok = self._matches_expedition(rec, action, token, choice_key=choice_key)
+            if not ok:
+                # 遭遇已直接触发队伍收敛（返程凭据覆盖了遭遇凭据）：
+                # 凭遭遇 token 回放那次返程结算，落败方同样拿到 200 而非 409；
+                # 对不上任何已知结算（token/选项不符）则落入统一的 409
+                settled = self._encounter_settlement_replay(token, choice_key=choice_key)
+                if settled[0] is not None:
+                    return settled
         else:
             ok = self._matches_expedition(rec, action, token, exp_token=exp_token)
         if ok:
@@ -888,11 +968,15 @@ class BunkerEngine:
             raise BunkerEngineConflict("探索队状态已过期，请刷新后重试")
         return self._settle_expedition(exp, reason="探索队安全返程")
 
-    def _settle_expedition(self, exp, reason):
+    def _settle_expedition(self, exp, reason, enc_token=None, enc_choice=None, pre_verdict=None):
         """结算探索队返程：战利品入库、剩余自带物资归还、伤亡扣减。
 
         幂等：以队伍 token 为凭据写入档案级 last_expedition，重复调用只回放，
-        不二次发放战利品。返回 (detail, replayed)。
+        不二次发放战利品。enc_token/enc_choice 非空表示本次返程由某次遭遇
+        抉择直接触发（补给耗尽/全员失联/终局收敛），返程凭据同时挂住该
+        遭遇的一次性 token，使该遭遇的连点/并发落败请求也能安全回放。
+        pre_verdict 为状态变更前快照的终局裁决（如行军日推进开始时已枯竭），
+        优先于本方法内部快照。返回 (detail, replayed)。
         """
         exp_token = exp.get("token")
         rec = self.session.last_expedition
@@ -900,13 +984,18 @@ class BunkerEngine:
             return rec.get("detail", ""), True
         members = self._away_residents()
         dead_members = [r for r in members if not r.alive]
+        # 终局裁决在战利品/余粮入库前快照：全线枯竭的败局不得被随后入库的
+        # 战利品抬过阈值而“复活”，终局状态与本结算只收敛一次（主动返程、
+        # 补给耗尽强制返程、遭遇收敛各路径口径一致）；调用方（行军日推进）
+        # 在产出前快照的更早裁决同样优先
+        verdict = pre_verdict if pre_verdict is not None else self._end_verdict()
         # 战利品入库
         loot = exp.get("loot", {})
         loot_parts = [f"{RESOURCE_ZH.get(k, k)} +{v:g}" for k, v in loot.items() if v > 0]
         for k, v in loot.items():
             if v > 0:
                 self._add_resource(k, v)
-        # 剩余自带物资归还地堡
+        # 剩余自带物资归还地堡（行军消耗已先行扣减，只归还正值余额）
         supplies = exp.get("supplies", {})
         supply_parts = [f"剩余{RESOURCE_ZH.get(k, k)} +{round(v, 1):g}" for k, v in supplies.items() if v > 0]
         for k, v in supplies.items():
@@ -927,9 +1016,13 @@ class BunkerEngine:
         detail = "；".join(detail_parts)
         self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
         # 先写档案级幂等凭据，再清除探索队状态：凭据在队伍消失后依然可查
-        self._remember_expedition(self._EXP_ACT_RETURN, None, detail, exp_token=exp_token)
+        self._remember_expedition(
+            self._EXP_ACT_RETURN, enc_token, detail,
+            exp_token=exp_token, choice_key=enc_choice,
+        )
         self.session.expedition = None
-        self._check_end()
+        # 用入库前快照收敛终局；无预设败局时再按结算后状态正常判定
+        self._check_end(forced_verdict=verdict)
         return detail, False
 
 
@@ -987,21 +1080,27 @@ class BunkerEngine:
         r.job = job
 
     # ---- 结局判定 ----
-    def _check_end(self):
+    def _check_end(self, forced_verdict=None):
+        """判定并落终局状态。
+
+        forced_verdict 为状态变更（如返程战利品入库）前快照的裁决：一旦在
+        变更前已满足终局（尤其是全线枯竭），即便变更后资源回升也照样收敛，
+        保证终局判定单调、不被中途入库的物资“救回”。返回是否处于终局。
+        """
         if self.session.status != "running":
             return True
-        if self._end_conditions_met():
-            # 区分胜负与结局文案
-            if self.session.day >= self.session.target_day:
-                self._finish(win=True, reason=f"坚持到第{self.session.day}天，末日阴影散去，幸存者们走向了新生。")
-            elif self.session.survivors <= 0:
-                self._finish(win=False, reason="所有幸存者都已逝去，地堡陷入永恒的寂静。")
-            else:
-                self._finish(win=False, reason="食物、水源、电力和氧气全线枯竭，地堡无法再维系生命。")
-            return True
-        return False
+        verdict = forced_verdict if forced_verdict is not None else self._end_verdict()
+        if verdict is None:
+            return False
+        win, reason = verdict
+        self._finish(win=win, reason=reason)
+        return True
 
     def _finish(self, win, reason):
+        # 幂等：终局只结算一次。重复调用（多路径收敛）直接返回，
+        # 不重算分数、不重复写结局日志
+        if self.session.status != "running":
+            return
         self.session.status = "win" if win else "over"
         # 进入终局后不存在悬而未决的抉择/在外队伍，状态机统一收敛到 ended
         self.session.pending_crisis = None
