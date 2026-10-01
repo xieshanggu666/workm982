@@ -171,6 +171,50 @@ def test_concurrent_crisis_resolve_loser_replays_200(client):
     assert r.json()["resources"]["food"] == 280  # 没有第二次扣减
 
 
+def test_concurrent_expedition_encounter_converges_loser_replays_200(client):
+    """遭遇直接收敛为返程（队员全灭）后：落败方带同一遭遇 token 重试 → 200 回放。
+
+    战利品/余粮/人口/终局只结算一次；胜者与落败者看到的档案终态一致。
+    """
+    team = {}
+
+    def setup(db, gs, eng):
+        # 更换为必定触发 trap 的脚本随机
+        from tests.test_engine import _RandEncounter
+        eng.rand = _RandEncounter("trap")
+        gs.residents[0].health = 10
+        eng.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+        encounter = eng.advance_day()
+        # 胜方先结算：force_free 致队员阵亡，全员失联立即收敛返程
+        detail, replayed = eng.resolve_expedition_encounter(
+            "force_free", token=encounter["token"]
+        )
+        assert replayed is False
+        team["token"] = encounter["token"]
+        team["exp_token"] = gs.last_expedition["exp_token"]
+
+    (sid,) = _seed(setup)
+    state = client.get(f"/api/sessions/{sid}").json()
+    survivors_after, food_after = state["survivors"], state["resources"]["food"]
+    assert state["expedition"] is None
+    # 落败方带同一遭遇负载重试：200 安全回放，人口/物资不变
+    r = client.post(f"/api/sessions/{sid}/expedition/resolve", json={
+        "choice_key": "force_free", "token": team["token"],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expedition"] is None
+    assert body["survivors"] == survivors_after
+    assert body["resources"]["food"] == food_after
+    # 玩家旧界面上的“主动返程”点击（队伍 token）：同样 200 回放
+    r2 = client.post(f"/api/sessions/{sid}/expedition/return", json={
+        "token": team["exp_token"],
+    })
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["expedition"] is None
+    assert r2.json()["survivors"] == survivors_after
+
+
 def test_concurrent_expedition_return_loser_replays_200(client):
     """对方已完成返程：落败方带同一队伍 token 重试 → 200 回放，战利品只入库一次。"""
     team = {}

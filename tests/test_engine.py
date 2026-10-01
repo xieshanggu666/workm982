@@ -839,22 +839,59 @@ def test_forced_return_when_supplies_out(db):
 
 
 def test_expedition_encounter_casualty(db):
-    """遭遇导致队员阵亡：伤亡记录在案，返程时不再重复扣减人口。"""
+    """遭遇导致队员阵亡：伤亡记录在案，收敛结算时不再重复扣减人口。
+
+    队中最后一人阵亡（全员失联）时，遭遇结算立即收敛返程：人口只扣一次，
+    不留下“仍在外但全员已故”的僵尸队伍；随后的主动返程/遭遇连点都只是
+    幂等回放，不二次扣减人口。
+    """
     gs = make_session(db)
     victim = gs.residents[0]
     victim.health = 10  # 重伤员，遭遇陷阱即可能阵亡
     eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="trap"))
     eng.send_expedition([victim.id], {FOOD: 10, WATER: 10})
     encounter = eng.advance_day()
+    team_token = gs.expedition["token"]
     before_survivors = gs.survivors
     # 陷阱·强行挣脱：健康 -18（单体），10 - 18 = -8 → 阵亡
-    eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    detail, replayed = eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    assert replayed is False
     assert victim.alive == 0
-    assert victim.id in gs.expedition["casualties"]
     assert gs.survivors == before_survivors - 1  # 人口已即时扣减
-    # 返程结算：不再重复扣减人口
-    eng.return_expedition(token=gs.expedition["token"])
+    # 全员失联 → 遭遇结算直接收敛返程：无僵尸队伍，地堡仍有幸存者则游戏继续
+    assert gs.expedition is None
+    assert gs.status == "running"
+    # 玩家随后主动点“返程”（旧队伍 token）：幂等回放，人口不再扣减
+    return_detail, return_replayed = eng.return_expedition(token=team_token)
+    assert return_replayed is True
     assert gs.survivors == before_survivors - 1
+    # 同一遭遇的连点/并发落败：回放遭遇明细，人口同样不再变动
+    enc_detail2, enc_replayed = eng.resolve_expedition_encounter(
+        "force_free", token=encounter["token"]
+    )
+    assert enc_replayed is True
+    assert enc_detail2 == detail
+    assert gs.survivors == before_survivors - 1
+
+
+def test_expedition_partial_casualty_keeps_marching(db):
+    """部分伤亡（队中仍有幸存者且补给未尽）：队伍继续在外行军，不提前返程。"""
+    gs = make_session(db)
+    gs.residents[0].health = 10  # 重伤队员随两人队出发
+    eng = BunkerEngine(db, gs, rand=ScriptedRand(encounter_key="trap"))
+    eng.send_expedition(
+        [gs.residents[0].id, gs.residents[1].id, gs.residents[2].id],
+        {FOOD: 20, WATER: 20},
+    )
+    encounter = eng.advance_day()
+    eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    # 一人殉职、两人存活，补给充足：队伍仍在外，可继续行军/主动返程
+    assert gs.expedition is not None
+    assert gs.residents[0].alive == 0
+    assert gs.residents[1].alive == 1
+    # 3 人行军耗 3，force_free 再损失 2 食物：20 - 3 - 2 = 15
+    assert gs.expedition["supplies"][FOOD] == 15
+    assert eng.phase == "daily"
 
 
 def test_away_residents_cannot_be_assigned(db):
@@ -1109,6 +1146,290 @@ def test_forced_return_at_max_days(db):
     result = eng.advance_day()
     assert result is None
     assert gs.expedition is None
+
+
+# ---- 遭遇结算后的状态收敛：补给耗尽 / 全员伤亡 / 人口归零，结算只发生一次 ----
+
+class _RandEncounter:
+    """必定触发指定 key 的探索遭遇。"""
+
+    def __init__(self, key):
+        self.key = key
+
+    def random(self):
+        return 0.1
+
+    def choice(self, seq):
+        if seq and isinstance(seq[0], dict):
+            return next(x for x in seq if x.get("key") == self.key)
+        return seq[0]
+
+
+def _send_and_arm_encounter(eng, gs, key, members, supplies):
+    eng.send_expedition(members, supplies)
+    encounter = eng.advance_day()
+    assert encounter["event"] == key
+    return encounter
+
+
+def test_encounter_supply_exhaustion_converges_immediately(db):
+    """遭遇把自带物资扣到归零：当日立即收敛返程，不等下一次行军。
+
+    战利品/剩余物资只入库一次，且同遭遇、同队伍的重复请求都只回放。
+    """
+    from app.models import EventLog
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("beast"))
+    # 1 人队带 4/4：行军一天耗 1 剩 3/3；beast·flee 损失 6 食物 4 水 → 0/0
+    encounter = _send_and_arm_encounter(
+        eng, gs, "beast", [gs.residents[0].id], {FOOD: 4, WATER: 4}
+    )
+    food_before = gs.resources[FOOD]
+    water_before = gs.resources[WATER]
+    detail, replayed = eng.resolve_expedition_encounter("flee", token=encounter["token"])
+    assert replayed is False
+    # 状态立即收敛：无僵尸队伍，阶段回到 daily（地堡仍有幸存者）
+    assert gs.expedition is None
+    assert eng.phase == "daily"
+    assert gs.status == "running"
+    # flee 无战利品，自带物资归零故无归还：地堡物资不因收敛发生变化
+    assert gs.resources[FOOD] == food_before
+    assert gs.resources[WATER] == water_before
+    # 档案级凭据：return 且登记了来源遭遇
+    rec = gs.last_expedition
+    assert rec["action"] == "return"
+    assert rec["enc_token"] == encounter["token"]
+    assert rec["choice"] == "flee"
+    # 同一遭遇连点/并发落败：回放遭遇明细，不再二次结算
+    detail2, replay2 = eng.resolve_expedition_encounter("flee", token=encounter["token"])
+    assert replay2 is True
+    assert detail2 == detail
+    # 返程日志只有一条
+    db.commit()
+    settle_logs = db.query(EventLog).filter_by(session_id=gs.id).filter(
+        EventLog.title.like("探索队返程%")
+    ).count()
+    assert settle_logs == 1
+
+
+def test_encounter_supply_exhaustion_settles_loot_once(db):
+    """补给耗尽被迫返程时，余粮为零故不归还；重复遭遇/返程请求都不二次入库。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("beast"))
+    # 1 人队带 2 食物 4 水：行军一天剩 1/3；beast·flee 损失 6 食物 4 水 → 0/0
+    encounter = _send_and_arm_encounter(
+        eng, gs, "beast", [gs.residents[0].id], {FOOD: 2, WATER: 4}
+    )
+    detail, replayed = eng.resolve_expedition_encounter("flee", token=encounter["token"])
+    assert replayed is False
+    assert gs.expedition is None  # 补给耗尽立即收敛（flee 无战利品，余粮均为 0）
+    food_after, water_after = gs.resources[FOOD], gs.resources[WATER]
+    # 同遭遇连点：回放，不再二次结算
+    detail2, replay2 = eng.resolve_expedition_encounter("flee", token=encounter["token"])
+    assert replay2 is True
+    assert detail2 == detail
+    assert gs.resources[FOOD] == food_after
+    # 主动返程（队伍 token）：同样回放，物资不动
+    team_token = gs.last_expedition["exp_token"]
+    detail3, replay3 = eng.return_expedition(token=team_token)
+    assert replay3 is True
+    assert detail3  # 回放的是返程明细
+    assert gs.resources[FOOD] == food_after
+    assert gs.resources[WATER] == water_after
+
+
+def test_encounter_all_casualties_but_bunker_alive_converges(db):
+    """队伍全员阵亡但地堡仍有幸存者：立即收敛，游戏继续，人口不重复扣减。"""
+    gs = make_session(db)
+    gs.residents[0].health = 10
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("trap"))
+    encounter = _send_and_arm_encounter(
+        eng, gs, "trap", [gs.residents[0].id], {FOOD: 10, WATER: 10}
+    )
+    before = gs.survivors
+    detail, replayed = eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    assert replayed is False
+    assert gs.residents[0].alive == 0
+    assert gs.survivors == before - 1
+    assert gs.expedition is None
+    assert gs.status == "running"
+    # 重复遭遇请求：人口不再被扣
+    _, replay2 = eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    assert replay2 is True
+    assert gs.survivors == before - 1
+
+
+def test_encounter_total_wipe_endgame_settles_once(db):
+    """遭遇杀死最后幸存者（人口归零终局）：先返程收敛再 ended，终局状态/评分只结算一次。
+
+    同一遭遇的并发落败/连点在档案 ended 后仍安全回放，而不是抛“游戏已结束”。
+    """
+    from app.models import EventLog
+
+    gs = make_session(db, residents=1)
+    gs.residents[0].health = 10
+    gs.resources = {FOOD: 50, WATER: 50, POWER: 50, OXY: 50}
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("trap"))
+    encounter = _send_and_arm_encounter(
+        eng, gs, "trap", [gs.residents[0].id], {FOOD: 10, WATER: 10}
+    )
+    detail, replayed = eng.resolve_expedition_encounter(
+        "force_free", token=encounter["token"]
+    )
+    assert replayed is False
+    # 统一收敛到 ended：无僵尸队伍、无悬而未决
+    assert gs.status == "over"
+    assert eng.phase == "ended"
+    assert gs.expedition is None
+    assert gs.pending_crisis is None
+    assert gs.survivors == 0
+    assert gs.outcome["survivors"] == 0
+    score = gs.score
+    db.commit()
+    end_logs_before = db.query(EventLog).filter_by(session_id=gs.id, title="游戏结束").count()
+    assert end_logs_before == 1
+    # 档案已 ended：同一遭遇重复请求仍安全回放（不抛异常、不二次写结局）
+    detail2, replay2 = eng.resolve_expedition_encounter("force_free", token=encounter["token"])
+    assert replay2 is True
+    assert detail2 == detail
+    assert gs.status == "over"
+    assert gs.score == score
+    db.commit()
+    end_logs_after = db.query(EventLog).filter_by(session_id=gs.id, title="游戏结束").count()
+    assert end_logs_after == 1
+    # 不同选项的旧请求：不得回放，终局档案拒绝变更
+    from app.services.engine import BunkerEngineError
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_expedition_encounter("free_carefully", token=encounter["token"])
+
+
+def test_concurrent_converging_encounter_loser_replays(db):
+    """并发结算同一个会触发收敛（队员全灭→立即返程）的遭遇：落败方安全回放。
+
+    落败请求在 commit 时撞乐观锁（效果不落库），随后凭遭遇凭据核对：
+    对方已把该遭遇收敛为返程，安全回放遭遇明细，战利品/人口只结算一次。
+    """
+    gs = make_session(db)
+    gs.residents[0].health = 10
+    seed = BunkerEngine(db, gs, rand=_RandEncounter("trap"))
+    # 1 人队带足口粮以撑到遭遇（行军耗 1 后仍有余粮）
+    seed.send_expedition([gs.residents[0].id], {FOOD: 10, WATER: 10})
+    encounter = seed.advance_day()
+    db.commit()
+    sid, token = gs.id, encounter["token"]
+
+    # 胜方：结算遭遇（force_free 致队员阵亡 → 全员失联收敛返程）
+    db_a = SessionLocal()
+    db_b = SessionLocal()
+    try:
+        ga = db_a.get(GameSession, sid)
+        BunkerEngine(db_a, ga).resolve_expedition_encounter("force_free", token=token)
+        db_a.commit()
+        # 落败方：持旧版本，仅在档案级凭据上核对回放（真实路由在 StaleDataError
+        # 回滚后走的就是 reconcile_stale_expedition）
+        gb = db_b.get(GameSession, sid)
+        replay_eng = BunkerEngine(db_b, gb)
+        detail, replayed = replay_eng.reconcile_stale_expedition(
+            "encounter", token=token, choice_key="force_free"
+        )
+        assert replayed is True
+        assert detail  # 回放遭遇明细
+
+        final = db_a.get(GameSession, sid)
+        assert final.expedition is None
+        # 仅探索队员（唯一离队者）阵亡，地堡还有 2 名幸存者：游戏继续
+        assert final.status == "running"
+        assert final.survivors == 2
+        # 无终局日志；返程日志只有一条（回放不产生新日志）
+        from app.models import EventLog
+        end_logs = db_a.query(EventLog).filter_by(
+            session_id=sid, title="游戏结束"
+        ).count()
+        assert end_logs == 0
+        settle_logs = db_a.query(EventLog).filter(
+            EventLog.session_id == sid, EventLog.title.like("探索队返程%")
+        ).count()
+        assert settle_logs == 1
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_converged_encounter_then_manual_return_loser_replays(db):
+    """遭遇已强制收敛清队后，并发的“主动返程”落败请求凭队伍 token 安全回放。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("beast"))
+    encounter = _send_and_arm_encounter(
+        eng, gs, "beast", [gs.residents[0].id], {FOOD: 4, WATER: 4}
+    )
+    eng.resolve_expedition_encounter("flee", token=encounter["token"])
+    assert gs.expedition is None
+    food_after = gs.resources[FOOD]
+    team_token = gs.last_expedition["exp_token"]
+    # 玩家在旧界面点“召回”：队伍虽已被强制结算，仍凭队伍 token 安全回放
+    detail, replayed = eng.return_expedition(token=team_token)
+    assert replayed is True
+    assert gs.resources[FOOD] == food_after
+    assert gs.expedition is None
+
+
+def test_continue_march_after_forced_settlement_is_clean(db):
+    """继续行军触发的强制返程结算后：档案处于 daily，再推进是全新一天且不重放旧账。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("beast"))
+    # 2 人队带 2/2：行军一天即耗尽，advance_day 内部强制返程
+    eng.send_expedition([gs.residents[0].id, gs.residents[1].id], {FOOD: 2, WATER: 2})
+    result = eng.advance_day()
+    assert result is None
+    assert gs.expedition is None
+    day_settled = gs.day
+    # 下一次推进：没有队伍，不挂遭遇，正常进入每日流程
+    eng2 = BunkerEngine(db, gs, rand=FixedRand())
+    enc = eng2.advance_day()
+    assert gs.day == day_settled + 1
+    assert enc is None
+    assert gs.expedition is None
+
+
+def test_encounter_exhaustion_still_returns_loot_and_supplies_once(db):
+    """遭遇收敛返程时，战利品与剩余物资（未归零的部分）一次性归还，重复请求不再入库。
+
+    场景：1 人队野兽遭遇，选择 fight：目标重伤阵亡（全员失联→立即收敛），
+    缴获食物 +5 战利品，剩余自带水 9 照常归还，阵亡者人口只扣一次。
+    """
+    gs = make_session(db)
+    gs.residents[0].health = 10
+    eng = BunkerEngine(db, gs, rand=_RandEncounter("beast"))
+    encounter = _send_and_arm_encounter(
+        eng, gs, "beast", [gs.residents[0].id], {FOOD: 10, WATER: 10}
+    )
+    # 行军一天后剩 9/9
+    assert gs.expedition["supplies"] == {FOOD: 9, WATER: 9}
+    food_base = gs.resources[FOOD]
+    water_base = gs.resources[WATER]
+    detail, replayed = eng.resolve_expedition_encounter("fight", token=encounter["token"])
+    assert replayed is False
+    # 全员阵亡 → 立即收敛：战利品食物 +5 入库，剩余水 +9 归还，食物 9 也一并归还
+    assert gs.expedition is None
+    assert gs.resources[FOOD] == round(food_base + 5 + 9, 1)
+    assert gs.resources[WATER] == round(water_base + 9, 1)
+    assert gs.survivors == 2
+    food_after, water_after = gs.resources[FOOD], gs.resources[WATER]
+    # 同一遭遇连点：回放遭遇明细，不二次入库
+    detail2, replay2 = eng.resolve_expedition_encounter("fight", token=encounter["token"])
+    assert replay2 is True
+    assert detail2 == detail
+    assert gs.resources[FOOD] == food_after
+    assert gs.resources[WATER] == water_after
+    assert gs.survivors == 2
+    # 玩家的主动返程请求（队伍 token）：回放返程明细，同样不二次结算
+    team_token = gs.last_expedition["exp_token"]
+    detail3, replay3 = eng.return_expedition(token=team_token)
+    assert replay3 is True
+    assert gs.resources[FOOD] == food_after
+    assert gs.resources[WATER] == water_after
+    assert gs.survivors == 2
 
 
 def test_end_at_target_day_settles_away_expedition(db):

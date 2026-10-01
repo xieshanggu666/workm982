@@ -692,36 +692,64 @@ class BunkerEngine:
     def _matches_expedition(rec, action, token, exp_token=None, choice_key=None):
         """判断落败/重试请求是否就是上一次已完成的那次探索队动作（幂等回放）。
 
-        - 遭遇：action=encounter，token=遭遇 token，再核对选项
-        - 返程：action=return，exp_token=队伍 token（返程凭据挂在队伍上）
+        - 遭遇（action=encounter，token=遭遇 token，再核对选项）：优先命中
+          动作仍是 encounter 的记录；若该遭遇已直接收敛为返程/终局（record 动作
+          为 return 且登记了来源遭遇 enc_token），同一遭遇请求同样视为回放——
+          收敛只发生过一次，落败方/连点不得再触发第二次返程结算。
+        - 返程（action=return，exp_token=队伍 token）：返程凭据挂在队伍 token 上，
+          遭遇收敛产生的返程记录同样带 exp_token，可被并发返程落败方识别。
         """
-        if not rec or rec.get("action") != action:
+        if not rec:
             return False
+        rec_action = rec.get("action")
+        if action == "encounter":
+            # 动作前进后的收敛记录：凭登记的来源遭遇 token + 选项核对
+            if rec_action == "return":
+                if token is None or not rec.get("enc_token") or token != rec["enc_token"]:
+                    return False
+                if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
+                    return False
+                return True
+            if rec_action != "encounter":
+                return False
+        else:
+            if rec_action != "return":
+                return False
+            if action == "return" and exp_token is not None and rec.get("exp_token") and exp_token != rec["exp_token"]:
+                return False
         if token is not None and rec.get("token") and token != rec["token"]:
-            return False
-        if action == "return" and exp_token is not None and rec.get("exp_token") and exp_token != rec["exp_token"]:
             return False
         if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
             return False
         return True
 
     def _last_expedition_replay(self, action, token, exp_token=None, choice_key=None):
-        """命中档案级幂等记录则返回 (detail, True)，否则返回 (None, False)。"""
+        """命中档案级幂等记录则返回 (detail, True)，否则返回 (None, False)。
+
+        遭遇请求命中的若是“由该遭遇直接收敛成的返程”记录，回放遭遇明细
+        （rec.enc_detail，与胜者从遭遇接口拿到的结果一致）而非返程明细。
+        """
         rec = self.session.last_expedition
         if self._matches_expedition(rec, action, token, exp_token=exp_token, choice_key=choice_key):
+            if action == self._EXP_ACT_ENCOUNTER and rec.get("action") == self._EXP_ACT_RETURN:
+                return rec.get("enc_detail") or rec.get("detail", ""), True
             return rec.get("detail", ""), True
         return None, False
 
-    def _remember_expedition(self, action, token, detail, exp_token=None, choice_key=None):
+    def _remember_expedition(self, action, token, detail, exp_token=None, choice_key=None,
+                             enc_token=None):
         """把已完成的探索队动作写入档案级幂等凭据。
 
         队伍随后可能被清除（返程）或继续在外（遭遇），凭据独立保存在档案上，
         使并发落败/连点请求在队伍消失后仍能被识别并安全回放。
+        enc_token 用于“遭遇直接收敛为返程/终局”的记录：登记来源遭遇 token 后，
+        携带该遭遇凭据的落败/重复请求也能命中本次返程结算并安全回放。
         """
         self.session.last_expedition = {
             "action": action,
             "token": token,
             "exp_token": exp_token,
+            "enc_token": enc_token,
             "choice": choice_key,
             "day": self.session.day,
             "detail": detail,
@@ -734,15 +762,15 @@ class BunkerEngine:
         token 用于识别过期/重复请求；结算后待处理遭遇被清除。
         返回 (detail, replayed)：replayed=True 表示重复/并发落败请求，未再次施加效果。
         """
-        self._ensure_running()
-        # 幂等回放优先：遭遇结算后、下一个探索队动作前的连点/并发落败只回放。
-        # 若档案级凭据已被后续动作（如返程）覆盖，说明遭遇所属状态已前进，
-        # 落到下方的“无在外队伍/无待处理遭遇”分支并按 409 拒绝
+        # 幂等回放优先，且早于终局守卫：遭遇若直接收敛成返程/终局，档案可能已 ended，
+        # 携带同一遭遇凭据的连点/并发落败方仍须安全回放（结算只发生过一次），
+        # 而不是收到“游戏已结束”或 409。凭据对不上时再落到下方状态/阶段校验。
         replay = self._last_expedition_replay(
             self._EXP_ACT_ENCOUNTER, token, choice_key=choice_key
         )
         if replay[0] is not None:
             return replay
+        self._ensure_running()
         exp = self.session.expedition
         if not exp or exp.get("status") != "away":
             # 携带遭遇凭据却找不到在外队伍：队伍已被其他请求召回，状态已前进
@@ -837,11 +865,31 @@ class BunkerEngine:
             self._EXP_ACT_ENCOUNTER, enc_token, detail,
             exp_token=exp.get("token"), choice_key=choice["key"],
         )
-        # 人口归零等终局条件：先让队伍安全返程再收敛到 ended，
-        # 避免在终局档案上留下无法处理的“僵尸队伍”
-        if self._end_conditions_met():
-            self._settle_expedition(self.session.expedition, reason="终局已至，探索队返程")
-            self._check_end()
+        # 遭遇结算后状态必须立即收敛，不得把零补给/全员失联的残队留成
+        # “仍在外但永远不再行军”的僵尸队伍（继续行军、主动返程、并发重复请求
+        # 看到的都应是同一个已收敛结果）：
+        #   1) 全员阵亡——无人生还，立即返程；
+        #   2) 自带食物/水归零——补给耗尽，被迫返程；
+        #   3) 人口归零等终局条件——先安全返程（战利品入库、幸存者归队）再 ended。
+        # 收敛统一走 _settle_expedition：战利品/余粮/伤亡只结算一次，
+        # 凭据登记来源遭遇（enc_token），使该遭遇的并发落败请求安全回放成同一次返程。
+        alive_after = [r for r in self._away_residents() if r.alive]
+        supplies_after = exp.get("supplies", {})
+        if not alive_after:
+            settle_reason = "探索队全员失联"
+        elif supplies_after.get(FOOD, 0) <= 0 or supplies_after.get(WATER, 0) <= 0:
+            settle_reason = "补给耗尽，探索队被迫返程"
+        elif self._end_conditions_met():
+            settle_reason = "终局已至，探索队返程"
+        else:
+            settle_reason = None
+        if settle_reason is not None:
+            # 收敛统一走 _settle_expedition：战利品/余粮/伤亡只结算一次，
+            # 凭据登记来源遭遇（enc_token），使该遭遇的并发落败请求安全回放成同一次返程
+            self._settle_expedition(
+                self.session.expedition, reason=settle_reason,
+                enc_token=enc_token, enc_choice=choice["key"], enc_detail=detail,
+            )
         return detail, False
 
     def reconcile_stale_expedition(self, action, token=None, choice_key=None, exp_token=None):
@@ -855,6 +903,10 @@ class BunkerEngine:
         else:
             ok = self._matches_expedition(rec, action, token, exp_token=exp_token)
         if ok:
+            # 遭遇直接收敛为返程/终局时：落败的遭遇请求回放遭遇明细，
+            # 与胜者从遭遇接口拿到的结果一致
+            if action == self._EXP_ACT_ENCOUNTER and rec.get("action") == self._EXP_ACT_RETURN:
+                return rec.get("enc_detail") or rec.get("detail", ""), True
             return rec.get("detail", ""), True
         raise BunkerEngineConflict("探索队状态已被其他请求更新，请刷新后重试")
 
@@ -865,8 +917,9 @@ class BunkerEngine:
         结算后探索队状态被清除并在档案上留下幂等凭据，重复提交只回放。
         返回 (detail, replayed)。
         """
-        self._ensure_running()
-        # 幂等回放优先：返程后队伍已清除，凭据仍在档案上可识别连点/并发落败请求
+        # 幂等回放优先（且早于终局守卫）：返程若因人口归零直接收敛到 ended，
+        # 档案已结束，携带同一队伍 token 的连点/并发落败方仍须安全回放，
+        # 而不是收到“游戏已结束”。返程后队伍已清除，凭据仍在档案上可识别。
         replay = self._last_expedition_replay(
             self._EXP_ACT_RETURN, None, exp_token=token
         )
@@ -888,15 +941,21 @@ class BunkerEngine:
             raise BunkerEngineConflict("探索队状态已过期，请刷新后重试")
         return self._settle_expedition(exp, reason="探索队安全返程")
 
-    def _settle_expedition(self, exp, reason):
+    def _settle_expedition(self, exp, reason, enc_token=None, enc_choice=None, enc_detail=None):
         """结算探索队返程：战利品入库、剩余自带物资归还、伤亡扣减。
 
         幂等：以队伍 token 为凭据写入档案级 last_expedition，重复调用只回放，
-        不二次发放战利品。返回 (detail, replayed)。
+        不二次发放战利品。
+        当返程由某次遭遇直接收敛（enc_token 非空）时，凭据同时登记来源遭遇
+        token/选项与遭遇明细：携带该遭遇凭据的并发落败/重复请求回放的是遭遇
+        明细（与胜者收到的结果一致），携带队伍 token 的返程请求回放的是返程明细。
+        返回 (detail, replayed)。
         """
         exp_token = exp.get("token")
         rec = self.session.last_expedition
         if rec and rec.get("action") == self._EXP_ACT_RETURN and rec.get("exp_token") == exp_token:
+            # 同一队伍的返程已结算：回放返程明细（遭遇凭据的回放走档案级
+            # _last_expedition_replay，会改取 enc_detail）
             return rec.get("detail", ""), True
         members = self._away_residents()
         dead_members = [r for r in members if not r.alive]
@@ -926,8 +985,14 @@ class BunkerEngine:
             detail_parts.append("全员平安归来")
         detail = "；".join(detail_parts)
         self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
-        # 先写档案级幂等凭据，再清除探索队状态：凭据在队伍消失后依然可查
-        self._remember_expedition(self._EXP_ACT_RETURN, None, detail, exp_token=exp_token)
+        # 先写档案级幂等凭据，再清除探索队状态：凭据在队伍消失后依然可查。
+        # 遭遇直接收敛时登记来源遭遇凭据，使该遭遇的落败/重复请求安全回放。
+        self._remember_expedition(
+            self._EXP_ACT_RETURN, None, detail, exp_token=exp_token,
+            enc_token=enc_token, choice_key=enc_choice,
+        )
+        if enc_detail is not None:
+            self.session.last_expedition["enc_detail"] = enc_detail
         self.session.expedition = None
         self._check_end()
         return detail, False
